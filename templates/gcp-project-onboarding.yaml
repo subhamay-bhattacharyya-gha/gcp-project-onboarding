@@ -10,7 +10,7 @@
 # Required org-level secrets:
 #   TFE_TOKEN              - HCP Terraform API token
 #   TF_VCS_OAUTH_TOKEN_ID  - OAuth token ID for VCS provider
-#   GITHUB_PAT             - Fine-grained PAT with:
+#   GH_PAT             - Fine-grained PAT with:
 #                              environments: read/write
 #                              administration: write
 # ============================================================
@@ -24,7 +24,7 @@ on:
         required: true
       TF_VCS_OAUTH_TOKEN_ID:
         required: true
-      GITHUB_PAT:
+      GH_PAT:
         required: true
 
     outputs:
@@ -49,7 +49,7 @@ jobs:
     steps:
 
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ── Step 0: Validate and parse env.json ──
       - name: Parse config
@@ -345,7 +345,7 @@ jobs:
       - name: Setup GitHub environments
         id: setup-environments
         env:
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           PROD_ENV: ${{ steps.parse.outputs.prod_env }}
           WAIT_TIMER: ${{ steps.parse.outputs.wait_timer }}
           REVIEWER_TEAMS: ${{ steps.parse.outputs.reviewer_teams }}
@@ -363,7 +363,7 @@ jobs:
             for SLUG in "${TEAMS[@]}"; do
               SLUG=$(echo "$SLUG" | tr -d ' ')
               TEAM_RESP=$(curl -s -w "\n%{http_code}" \
-                --header "Authorization: Bearer $GITHUB_PAT" \
+                --header "Authorization: Bearer $GH_PAT" \
                 --header "Accept: application/vnd.github+json" \
                 --header "X-GitHub-Api-Version: 2022-11-28" \
                 "https://api.github.com/orgs/$OWNER/teams/$SLUG")
@@ -403,7 +403,7 @@ jobs:
             # PUT is always an upsert — safe to re-run
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               --request PUT \
-              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Authorization: Bearer $GH_PAT" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               --header "Content-Type: application/json" \
@@ -422,7 +422,7 @@ jobs:
             if [ -n "$GCP_ID" ]; then
               VAR_RESPONSE=$(curl -s -w "\n%{http_code}" \
                 --request POST \
-                --header "Authorization: Bearer $GITHUB_PAT" \
+                --header "Authorization: Bearer $GH_PAT" \
                 --header "Accept: application/vnd.github+json" \
                 --header "X-GitHub-Api-Version: 2022-11-28" \
                 --header "Content-Type: application/json" \
@@ -434,7 +434,7 @@ jobs:
                 # Variable exists — update it
                 curl -s -o /dev/null \
                   --request PATCH \
-                  --header "Authorization: Bearer $GITHUB_PAT" \
+                  --header "Authorization: Bearer $GH_PAT" \
                   --header "Accept: application/vnd.github+json" \
                   --header "X-GitHub-Api-Version: 2022-11-28" \
                   --header "Content-Type: application/json" \
@@ -458,12 +458,12 @@ jobs:
         id: setup-ruleset
         if: steps.parse.outputs.create_ruleset == 'true'
         env:
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           RULESET_NAME="standard-branch-protection"
 
           EXISTING_ID=$(curl -s \
-            --header "Authorization: Bearer $GITHUB_PAT" \
+            --header "Authorization: Bearer $GH_PAT" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets" \
@@ -520,7 +520,7 @@ jobs:
           if [ -n "$EXISTING_ID" ]; then
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               --request PUT \
-              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Authorization: Bearer $GH_PAT" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               --header "Content-Type: application/json" \
@@ -530,7 +530,7 @@ jobs:
           else
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               --request POST \
-              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Authorization: Bearer $GH_PAT" \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               --header "Content-Type: application/json" \
