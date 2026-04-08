@@ -74,10 +74,9 @@ jobs:
           # ── HCP Terraform ──
           TFE_ADDRESS=$(echo "$CONFIG"   | jq -r '.hcp.tfe_address        // "https://app.terraform.io"')
           TF_ORG=$(echo "$CONFIG"        | jq -r '.hcp.organization')
-          WS_NAME=$(echo "$CONFIG"       | jq -r '.hcp.workspace_name     // ""')
           TF_VERSION=$(echo "$CONFIG"    | jq -r '.hcp.terraform_version  // "1.7.0"')
           EXEC_MODE=$(echo "$CONFIG"     | jq -r '.hcp.execution_mode     // "remote"')
-          WORK_DIR=$(echo "$CONFIG"      | jq -r '.hcp.working_directory  // ""')
+          WORK_DIR="tf/"
           BRANCH=$(echo "$CONFIG"        | jq -r '.hcp.branch             // "main"')
           AUTO_APPLY=$(echo "$CONFIG"    | jq -r '.hcp.auto_apply         // false')
 
@@ -87,24 +86,8 @@ jobs:
             exit 1
           fi
 
-          # Default workspace name to repository name if not specified
-          [ -z "$WS_NAME" ] || [ "$WS_NAME" = "null" ] && WS_NAME="${GITHUB_REPOSITORY##*/}"
-
-          # ── GitHub Environments ──
-          PROD_ENV=$(echo "$CONFIG"      | jq -r '.github.production_environment // "production"')
-          WAIT_TIMER=$(echo "$CONFIG"    | jq -r '.github.wait_timer             // 0')
-          REVIEWER_TEAMS=$(echo "$CONFIG"| jq -r '.github.reviewer_teams         // [] | join(",")')
-
-          # ── Ruleset ──
-          CREATE_RULESET=$(echo "$CONFIG"     | jq -r '.ruleset.enabled                 // true')
-          RULESET_BRANCH=$(echo "$CONFIG"     | jq -r '.ruleset.target_branch           // "~DEFAULT_BRANCH"')
-          REQUIRE_PR=$(echo "$CONFIG"         | jq -r '.ruleset.require_pr              // true')
-          REQ_APPROVALS=$(echo "$CONFIG"      | jq -r '.ruleset.required_approvals      // 1')
-          DISMISS_STALE=$(echo "$CONFIG"      | jq -r '.ruleset.dismiss_stale_reviews   // true')
-          STATUS_CHECKS=$(echo "$CONFIG"      | jq -c '.ruleset.required_status_checks  // []')
-          BLOCK_FORCE=$(echo "$CONFIG"        | jq -r '.ruleset.block_force_pushes      // true')
-          PREVENT_DEL=$(echo "$CONFIG"        | jq -r '.ruleset.prevent_deletion        // true')
-          BRANCH_PATTERN=$(echo "$CONFIG"     | jq -r '.ruleset.branch_name_pattern     // ""')
+          # Workspace name is always the repository name
+          WS_NAME="${GITHUB_REPOSITORY##*/}"
 
           # Export everything as step outputs
           {
@@ -116,18 +99,6 @@ jobs:
             echo "work_dir=$WORK_DIR"
             echo "branch=$BRANCH"
             echo "auto_apply=$AUTO_APPLY"
-            echo "prod_env=$PROD_ENV"
-            echo "wait_timer=$WAIT_TIMER"
-            echo "reviewer_teams=$REVIEWER_TEAMS"
-            echo "create_ruleset=$CREATE_RULESET"
-            echo "ruleset_branch=$RULESET_BRANCH"
-            echo "require_pr=$REQUIRE_PR"
-            echo "req_approvals=$REQ_APPROVALS"
-            echo "dismiss_stale=$DISMISS_STALE"
-            echo "status_checks=$STATUS_CHECKS"
-            echo "block_force=$BLOCK_FORCE"
-            echo "prevent_del=$PREVENT_DEL"
-            echo "branch_pattern=$BRANCH_PATTERN"
           } >> "$GITHUB_OUTPUT"
 
           echo "Config parsed successfully"
@@ -342,24 +313,30 @@ jobs:
           fi
 
       # ── Step 6: Create / update GitHub Environments ──
+      # ── Step 6: Create / update GitHub Environments ──
+      # Production environment name and wait timer are platform-enforced.
+      # Reviewer teams are read from .github/CODEOWNERS — not configurable via env.json.
       - name: Setup GitHub environments
         id: setup-environments
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
-          PROD_ENV: ${{ steps.parse.outputs.prod_env }}
-          WAIT_TIMER: ${{ steps.parse.outputs.wait_timer }}
-          REVIEWER_TEAMS: ${{ steps.parse.outputs.reviewer_teams }}
         run: |
           CONFIG=$(jq -c 'del(.. | ._comment?)' env.json)
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           REPO="$GITHUB_REPOSITORY"
 
-          # Read CODEOWNERS and add teams as collaborators with write access
-          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          # Platform-enforced settings
+          PROD_ENV="prod"
+          WAIT_TIMER=5
+
+          # Read CODEOWNERS to extract team slugs — these become collaborators and reviewers
+          REVIEWER_IDS="[]"
           if [ -f .github/CODEOWNERS ]; then
-            echo "  Reading .github/CODEOWNERS for team collaborators"
-            grep -oE '@[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+' .github/CODEOWNERS | sort -u | while read -r TEAM_REF; do
+            echo "  Reading .github/CODEOWNERS for team collaborators and reviewers"
+            while read -r TEAM_REF; do
               TEAM_SLUG="${TEAM_REF##*/}"
+
+              # Add team as collaborator with write access
               echo "  Adding team '$TEAM_SLUG' as collaborator with write access"
               COLLAB_RESP=$(curl -s -w "\n%{http_code}" \
                 --request PUT \
@@ -371,52 +348,31 @@ jobs:
                 "https://api.github.com/orgs/$OWNER/teams/$TEAM_SLUG/repos/$REPO")
               COLLAB_STATUS=$(echo "$COLLAB_RESP" | tail -1)
               if [ "$COLLAB_STATUS" != "204" ]; then
-                echo "WARNING: Could not add team '$TEAM_SLUG' as collaborator (HTTP $COLLAB_STATUS)"
-                echo "$COLLAB_RESP" | head -n -1 | jq . 2>/dev/null || true
+                echo "  WARNING: Could not add team '$TEAM_SLUG' as collaborator (HTTP $COLLAB_STATUS)"
               else
                 echo "  Team '$TEAM_SLUG' added as collaborator"
               fi
-            done
-          else
-            echo "  No .github/CODEOWNERS found — skipping team collaborator setup"
-          fi
 
-          # Resolve reviewer team slugs → integer IDs (done once before the env loop)
-          REVIEWER_IDS="[]"
-          if [ -n "$REVIEWER_TEAMS" ]; then
-            IFS=',' read -ra TEAMS <<< "$REVIEWER_TEAMS"
-            for SLUG in "${TEAMS[@]}"; do
-              SLUG=$(echo "$SLUG" | tr -d ' ')
-
-              # Ensure reviewer team is also a collaborator with write access
-              echo "  Ensuring reviewer team '$SLUG' has write access"
-              curl -s -o /dev/null -w "%{http_code}" \
-                --request PUT \
-                --header "Authorization: Bearer $GH_PAT" \
-                --header "Accept: application/vnd.github+json" \
-                --header "X-GitHub-Api-Version: 2022-11-28" \
-                --header "Content-Type: application/json" \
-                --data '{"permission":"push"}' \
-                "https://api.github.com/orgs/$OWNER/teams/$SLUG/repos/$REPO" > /dev/null
-
+              # Resolve team slug → integer ID for environment reviewers
               TEAM_RESP=$(curl -s -w "\n%{http_code}" \
                 --header "Authorization: Bearer $GH_PAT" \
                 --header "Accept: application/vnd.github+json" \
                 --header "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/orgs/$OWNER/teams/$SLUG")
+                "https://api.github.com/orgs/$OWNER/teams/$TEAM_SLUG")
               HTTP_STATUS=$(echo "$TEAM_RESP" | tail -1)
               BODY=$(echo "$TEAM_RESP" | head -n -1)
-              if [ "$HTTP_STATUS" != "200" ]; then
-                echo "ERROR: Could not resolve team '$SLUG' (HTTP $HTTP_STATUS)"
-                echo "$BODY" | jq .
-                exit 1
+              if [ "$HTTP_STATUS" = "200" ]; then
+                TEAM_ID=$(echo "$BODY" | jq -r '.id')
+                REVIEWER_IDS=$(echo "$REVIEWER_IDS" | jq -c --argjson id "$TEAM_ID" '. + [{"type":"Team","id":$id}]')
+                echo "  Team '$TEAM_SLUG' added as reviewer (ID: $TEAM_ID)"
+              else
+                echo "  WARNING: Could not resolve team '$TEAM_SLUG' for reviewer (HTTP $HTTP_STATUS)"
               fi
-              TEAM_ID=$(echo "$BODY" | jq -r '.id')
-              REVIEWER_IDS=$(echo "$REVIEWER_IDS" | jq -c --argjson id "$TEAM_ID" '. + [{"type":"Team","id":$id}]')
-            done
+            done < <(grep -oE '@[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+' .github/CODEOWNERS | sort -u)
+          else
+            echo "  No .github/CODEOWNERS found — no reviewers will be configured"
           fi
           echo "  Resolved reviewers: $REVIEWER_IDS"
-          export REVIEWER_IDS
 
           # Iterate over environments defined in config — use process substitution to avoid subshell
           while read -r ENV_OBJ; do
@@ -495,9 +451,9 @@ jobs:
           done < <(echo "$CONFIG" | jq -c '.environments[]')
 
       # ── Step 7: Create / update repository ruleset ──
+      # Ruleset settings are hardcoded by the platform team — not configurable via env.json
       - name: Setup repository ruleset
         id: setup-ruleset
-        if: steps.parse.outputs.create_ruleset == 'true'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
@@ -510,45 +466,41 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets" \
             | jq -r --arg name "$RULESET_NAME" '.[] | select(.name == $name) | .id // empty')
 
-          # Build rules array using jq
-          RULES='[]'
-
-          [ "${{ steps.parse.outputs.prevent_del }}" = "true" ] && \
-            RULES=$(echo "$RULES" | jq '. + [{"type":"deletion"}]')
-
-          [ "${{ steps.parse.outputs.block_force }}" = "true" ] && \
-            RULES=$(echo "$RULES" | jq '. + [{"type":"non_fast_forward"}]')
-
-          if [ "${{ steps.parse.outputs.require_pr }}" = "true" ]; then
-            RULES=$(echo "$RULES" | jq \
-              --argjson approvals "${{ steps.parse.outputs.req_approvals }}" \
-              --argjson dismiss   "${{ steps.parse.outputs.dismiss_stale }}" \
-              '. + [{"type":"pull_request","parameters":{"required_approving_review_count":$approvals,"dismiss_stale_reviews_on_push":$dismiss,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":false}}]')
-          fi
-
-          STATUS_CHECKS='${{ steps.parse.outputs.status_checks }}'
-          CHECKS_COUNT=$(echo "$STATUS_CHECKS" | jq 'length')
-          if [ "$CHECKS_COUNT" -gt "0" ]; then
-            CHECKS_PAYLOAD=$(echo "$STATUS_CHECKS" | jq '[.[] | {"context":.}]')
-            RULES=$(echo "$RULES" | jq \
-              --argjson checks "$CHECKS_PAYLOAD" \
-              '. + [{"type":"required_status_checks","parameters":{"required_status_checks":$checks,"strict_required_status_checks_policy":false}}]')
-          fi
-
-          BRANCH_PATTERN='${{ steps.parse.outputs.branch_pattern }}'
-          if [ -n "$BRANCH_PATTERN" ]; then
-            RULES=$(echo "$RULES" | jq \
-              --arg pattern "$BRANCH_PATTERN" \
-              '. + [{"type":"branch_name_pattern","parameters":{"name":"Branch naming convention","negate":false,"operator":"regex","pattern":$pattern}}]')
-          fi
-
-          PAYLOAD=$(jq -n \
-            --arg  name   "$RULESET_NAME" \
-            --arg  branch "${{ steps.parse.outputs.ruleset_branch }}" \
-            --argjson rules "$RULES" \
-            '{name:$name,target:"branch",enforcement:"active",
-              conditions:{ref_name:{include:[$branch],exclude:[]}},
-              rules:$rules}')
+          # Platform-enforced ruleset — hardcoded, not developer-configurable
+          PAYLOAD=$(jq -n '{
+            name: "standard-branch-protection",
+            target: "branch",
+            enforcement: "active",
+            conditions: {
+              ref_name: {
+                include: ["~DEFAULT_BRANCH"],
+                exclude: []
+              }
+            },
+            rules: [
+              { type: "deletion" },
+              { type: "non_fast_forward" },
+              {
+                type: "pull_request",
+                parameters: {
+                  required_approving_review_count: 1,
+                  dismiss_stale_reviews_on_push: true,
+                  require_code_owner_review: true,
+                  require_last_push_approval: true,
+                  required_review_thread_resolution: false
+                }
+              },
+              {
+                type: "branch_name_pattern",
+                parameters: {
+                  name: "Branch naming convention",
+                  negate: false,
+                  operator: "regex",
+                  pattern: "^(feature|bugfix|hotfix|release|chore)/GHA-[0-9]+-[a-z0-9-]+$"
+                }
+              }
+            ]
+          }')
 
           if [ -n "$EXISTING_ID" ]; then
             RESPONSE=$(curl -s -w "\n%{http_code}" \
@@ -600,6 +552,6 @@ jobs:
           | Workspace ID | ${{ steps.resolve.outputs.workspace_id }} | — |
           | Repository | $GITHUB_REPOSITORY | linked |
           | Environments | $ENVS | configured |
-          | Production approval gate | ${{ steps.parse.outputs.prod_env }} | enabled |
-          | Repository ruleset | standard-branch-protection | ${{ steps.parse.outputs.create_ruleset == 'true' && 'configured' || 'skipped' }} |
+          | Production approval gate | prod | enabled |
+          | Repository ruleset | standard-branch-protection | configured |
           EOF
