@@ -469,45 +469,37 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets" \
             | jq -r --arg name "$RULESET_NAME" '.[] | select(.name == $name) | .id // empty')
 
-          # Build rules array from parsed config outputs
-          RULES="["
-          FIRST_RULE=true
-          add_rule() {
-            [ "$FIRST_RULE" = "true" ] && FIRST_RULE=false || RULES="$RULES,"
-            RULES="$RULES$1"
-          }
+          # Build rules array using jq
+          RULES='[]'
 
-          [ "${{ steps.parse.outputs.prevent_del }}"  = "true" ] && add_rule '{"type":"deletion"}'
-          [ "${{ steps.parse.outputs.block_force }}"  = "true" ] && add_rule '{"type":"non_fast_forward"}'
+          [ "${{ steps.parse.outputs.prevent_del }}" = "true" ] && \
+            RULES=$(echo "$RULES" | jq '. + [{"type":"deletion"}]')
+
+          [ "${{ steps.parse.outputs.block_force }}" = "true" ] && \
+            RULES=$(echo "$RULES" | jq '. + [{"type":"non_fast_forward"}]')
 
           if [ "${{ steps.parse.outputs.require_pr }}" = "true" ]; then
-            add_rule "{\"type\":\"pull_request\",\"parameters\":{
-              \"required_approving_review_count\":${{ steps.parse.outputs.req_approvals }},
-              \"dismiss_stale_reviews_on_push\":${{ steps.parse.outputs.dismiss_stale }},
-              \"require_code_owner_review\":false,
-              \"require_last_push_approval\":false,
-              \"required_review_thread_resolution\":false}}"
+            RULES=$(echo "$RULES" | jq \
+              --argjson approvals "${{ steps.parse.outputs.req_approvals }}" \
+              --argjson dismiss   "${{ steps.parse.outputs.dismiss_stale }}" \
+              '. + [{"type":"pull_request","parameters":{"required_approving_review_count":$approvals,"dismiss_stale_reviews_on_push":$dismiss,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":false}}]')
           fi
 
           STATUS_CHECKS='${{ steps.parse.outputs.status_checks }}'
           CHECKS_COUNT=$(echo "$STATUS_CHECKS" | jq 'length')
           if [ "$CHECKS_COUNT" -gt "0" ]; then
             CHECKS_PAYLOAD=$(echo "$STATUS_CHECKS" | jq '[.[] | {"context":., "integration_id":null}]')
-            add_rule "{\"type\":\"required_status_checks\",\"parameters\":{
-              \"required_status_checks\":$CHECKS_PAYLOAD,
-              \"strict_required_status_checks_policy\":false}}"
+            RULES=$(echo "$RULES" | jq \
+              --argjson checks "$CHECKS_PAYLOAD" \
+              '. + [{"type":"required_status_checks","parameters":{"required_status_checks":$checks,"strict_required_status_checks_policy":false}}]')
           fi
 
           BRANCH_PATTERN='${{ steps.parse.outputs.branch_pattern }}'
           if [ -n "$BRANCH_PATTERN" ]; then
-            add_rule "{\"type\":\"branch_name_pattern\",\"parameters\":{
-              \"name\":\"Branch naming convention\",
-              \"negate\":false,
-              \"operator\":\"regex\",
-              \"pattern\":\"$BRANCH_PATTERN\"}}"
+            RULES=$(echo "$RULES" | jq \
+              --arg pattern "$BRANCH_PATTERN" \
+              '. + [{"type":"branch_name_pattern","parameters":{"name":"Branch naming convention","negate":false,"operator":"regex","pattern":$pattern}}]')
           fi
-
-          RULES="$RULES]"
 
           PAYLOAD=$(jq -n \
             --arg  name   "$RULESET_NAME" \
