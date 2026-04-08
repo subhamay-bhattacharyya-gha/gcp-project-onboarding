@@ -393,11 +393,11 @@ jobs:
               PAYLOAD=$(jq -n \
                 --argjson wait      "$WAIT_TIMER" \
                 --argjson reviewers "$REVIEWER_IDS" \
-                '{wait_timer:$wait,prevent_self_review:false,reviewers:$reviewers,deployment_branch_policy:null}')
-              echo "  Tier: production — approval gate enabled (wait=${WAIT_TIMER}m)"
+                '{wait_timer:$wait,prevent_self_review:true,reviewers:$reviewers,deployment_branch_policy:null}')
+              echo "  Tier: production — approval gate enabled (wait=${WAIT_TIMER}m, self-review blocked)"
             else
-              PAYLOAD='{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}'
-              echo "  Tier: non-production — no approval gate"
+              PAYLOAD='{"wait_timer":0,"prevent_self_review":true,"reviewers":[],"deployment_branch_policy":null}'
+              echo "  Tier: non-production — self-review blocked"
             fi
 
             # PUT is always an upsert — safe to re-run
@@ -482,7 +482,7 @@ jobs:
             RULES=$(echo "$RULES" | jq \
               --argjson approvals "${{ steps.parse.outputs.req_approvals }}" \
               --argjson dismiss   "${{ steps.parse.outputs.dismiss_stale }}" \
-              '. + [{"type":"pull_request","parameters":{"required_approving_review_count":$approvals,"dismiss_stale_reviews_on_push":$dismiss,"require_code_owner_review":false,"require_last_push_approval":false,"required_review_thread_resolution":false}}]')
+              '. + [{"type":"pull_request","parameters":{"required_approving_review_count":$approvals,"dismiss_stale_reviews_on_push":$dismiss,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":false}}]')
           fi
 
           STATUS_CHECKS='${{ steps.parse.outputs.status_checks }}'
