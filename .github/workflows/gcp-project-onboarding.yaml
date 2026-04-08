@@ -357,8 +357,6 @@ jobs:
           # Resolve reviewer team slugs → integer IDs (done once before the env loop)
           REVIEWER_IDS="[]"
           if [ -n "$REVIEWER_TEAMS" ]; then
-            REVIEWER_IDS="["
-            FIRST=true
             IFS=',' read -ra TEAMS <<< "$REVIEWER_TEAMS"
             for SLUG in "${TEAMS[@]}"; do
               SLUG=$(echo "$SLUG" | tr -d ' ')
@@ -375,14 +373,13 @@ jobs:
                 exit 1
               fi
               TEAM_ID=$(echo "$BODY" | jq -r '.id')
-              [ "$FIRST" = "true" ] && FIRST=false || REVIEWER_IDS="$REVIEWER_IDS,"
-              REVIEWER_IDS="${REVIEWER_IDS}{\"type\":\"Team\",\"id\":$TEAM_ID}"
+              REVIEWER_IDS=$(echo "$REVIEWER_IDS" | jq --argjson id "$TEAM_ID" '. + [{"type":"Team","id":$id}]')
             done
-            REVIEWER_IDS="$REVIEWER_IDS]"
           fi
+          echo "  Resolved reviewers: $REVIEWER_IDS"
 
-          # Iterate over environments defined in config
-          echo "$CONFIG" | jq -c '.environments[]' | while read -r ENV_OBJ; do
+          # Iterate over environments defined in config — use process substitution to avoid subshell
+          while read -r ENV_OBJ; do
             ENV_NAME=$(echo "$ENV_OBJ"   | jq -r '.name')
             GCP_ID=$(echo "$ENV_OBJ"     | jq -r '.gcp_project_id // empty')
 
@@ -453,7 +450,7 @@ jobs:
             else
               echo "  GCP_PROJECT_ID not provided for '$ENV_NAME' — skipping"
             fi
-          done
+          done < <(echo "$CONFIG" | jq -c '.environments[]')
 
       # ── Step 7: Create / update repository ruleset ──
       - name: Setup repository ruleset
