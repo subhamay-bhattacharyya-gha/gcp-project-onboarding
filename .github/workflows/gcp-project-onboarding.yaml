@@ -488,7 +488,7 @@ jobs:
           STATUS_CHECKS='${{ steps.parse.outputs.status_checks }}'
           CHECKS_COUNT=$(echo "$STATUS_CHECKS" | jq 'length')
           if [ "$CHECKS_COUNT" -gt "0" ]; then
-            CHECKS_PAYLOAD=$(echo "$STATUS_CHECKS" | jq '[.[] | {"context":., "integration_id":null}]')
+            CHECKS_PAYLOAD=$(echo "$STATUS_CHECKS" | jq '[.[] | {"context":.}]')
             RULES=$(echo "$RULES" | jq \
               --argjson checks "$CHECKS_PAYLOAD" \
               '. + [{"type":"required_status_checks","parameters":{"required_status_checks":$checks,"strict_required_status_checks_policy":false}}]')
