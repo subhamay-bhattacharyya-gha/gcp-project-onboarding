@@ -354,12 +354,51 @@ jobs:
           OWNER="${GITHUB_REPOSITORY_OWNER}"
           REPO="$GITHUB_REPOSITORY"
 
+          # Read CODEOWNERS and add teams as collaborators with write access
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [ -f .github/CODEOWNERS ]; then
+            echo "  Reading .github/CODEOWNERS for team collaborators"
+            grep -oE '@[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+' .github/CODEOWNERS | sort -u | while read -r TEAM_REF; do
+              TEAM_SLUG="${TEAM_REF##*/}"
+              echo "  Adding team '$TEAM_SLUG' as collaborator with write access"
+              COLLAB_RESP=$(curl -s -w "\n%{http_code}" \
+                --request PUT \
+                --header "Authorization: Bearer $GH_PAT" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/json" \
+                --data '{"permission":"push"}' \
+                "https://api.github.com/orgs/$OWNER/teams/$TEAM_SLUG/repos/$REPO")
+              COLLAB_STATUS=$(echo "$COLLAB_RESP" | tail -1)
+              if [ "$COLLAB_STATUS" != "204" ]; then
+                echo "WARNING: Could not add team '$TEAM_SLUG' as collaborator (HTTP $COLLAB_STATUS)"
+                echo "$COLLAB_RESP" | head -n -1 | jq . 2>/dev/null || true
+              else
+                echo "  Team '$TEAM_SLUG' added as collaborator"
+              fi
+            done
+          else
+            echo "  No .github/CODEOWNERS found — skipping team collaborator setup"
+          fi
+
           # Resolve reviewer team slugs → integer IDs (done once before the env loop)
           REVIEWER_IDS="[]"
           if [ -n "$REVIEWER_TEAMS" ]; then
             IFS=',' read -ra TEAMS <<< "$REVIEWER_TEAMS"
             for SLUG in "${TEAMS[@]}"; do
               SLUG=$(echo "$SLUG" | tr -d ' ')
+
+              # Ensure reviewer team is also a collaborator with write access
+              echo "  Ensuring reviewer team '$SLUG' has write access"
+              curl -s -o /dev/null -w "%{http_code}" \
+                --request PUT \
+                --header "Authorization: Bearer $GH_PAT" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/json" \
+                --data '{"permission":"push"}' \
+                "https://api.github.com/orgs/$OWNER/teams/$SLUG/repos/$REPO" > /dev/null
+
               TEAM_RESP=$(curl -s -w "\n%{http_code}" \
                 --header "Authorization: Bearer $GH_PAT" \
                 --header "Accept: application/vnd.github+json" \
