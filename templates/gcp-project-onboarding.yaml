@@ -373,10 +373,11 @@ jobs:
                 exit 1
               fi
               TEAM_ID=$(echo "$BODY" | jq -r '.id')
-              REVIEWER_IDS=$(echo "$REVIEWER_IDS" | jq --argjson id "$TEAM_ID" '. + [{"type":"Team","id":$id}]')
+              REVIEWER_IDS=$(echo "$REVIEWER_IDS" | jq -c --argjson id "$TEAM_ID" '. + [{"type":"Team","id":$id}]')
             done
           fi
           echo "  Resolved reviewers: $REVIEWER_IDS"
+          export REVIEWER_IDS
 
           # Iterate over environments defined in config — use process substitution to avoid subshell
           while read -r ENV_OBJ; do
@@ -398,6 +399,8 @@ jobs:
               PAYLOAD='{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}'
               echo "  Tier: non-production — no approval gate"
             fi
+
+            echo "  Payload: $PAYLOAD"
 
             # PUT is always an upsert — safe to re-run
             RESPONSE=$(curl -s -w "\n%{http_code}" \
