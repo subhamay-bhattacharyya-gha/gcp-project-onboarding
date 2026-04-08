@@ -1,0 +1,572 @@
+# ============================================================
+# GCP Project Onboarding — Reusable Workflow
+# Repository : <ORG>/gcp-project-onboarding
+# Trigger    : workflow_call only (never push/schedule)
+#
+# All project configuration is read from env.json in the caller
+# repository root. See env.json for the full schema and field
+# descriptions.
+#
+# Required org-level secrets:
+#   TFE_TOKEN              - HCP Terraform API token
+#   TF_VCS_OAUTH_TOKEN_ID  - OAuth token ID for VCS provider
+#   GITHUB_PAT             - Fine-grained PAT with:
+#                              environments: read/write
+#                              administration: write
+# ============================================================
+
+name: GCP Project Onboarding
+
+on:
+  workflow_call:
+    secrets:
+      TFE_TOKEN:
+        required: true
+      TF_VCS_OAUTH_TOKEN_ID:
+        required: true
+      GITHUB_PAT:
+        required: true
+
+    outputs:
+      workspace_id:
+        description: 'The HCP Terraform workspace ID'
+        value: ${{ jobs.onboard.outputs.workspace_id }}
+      workspace_created:
+        description: 'true if the workspace was newly created, false if it already existed'
+        value: ${{ jobs.onboard.outputs.workspace_created }}
+
+jobs:
+  onboard:
+    name: Onboard GCP Project
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      workspace_id:    ${{ steps.resolve.outputs.workspace_id }}
+      workspace_created: ${{ steps.parse.outputs.ws_name != '' }}
+
+    steps:
+
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+
+      # ── Step 0: Validate and parse env.json ──
+      - name: Parse config
+        id: parse
+        run: |
+          # Validate that env.json exists
+          if [ ! -f env.json ]; then
+            echo "ERROR: env.json not found in repository root"
+            echo "Copy env.json from the platform repo, fill in your values, and commit it"
+            exit 1
+          fi
+
+          # Validate that env.json is parseable JSON
+          if ! jq empty env.json 2>/dev/null; then
+            echo "ERROR: env.json is not valid JSON"
+            exit 1
+          fi
+
+          # Strip comment keys and load config
+          CONFIG=$(jq 'del(.. | ._comment?)' env.json | jq -c .)
+
+          # ── HCP Terraform ──
+          TFE_ADDRESS=$(echo "$CONFIG"   | jq -r '.hcp.tfe_address        // "https://app.terraform.io"')
+          TF_ORG=$(echo "$CONFIG"        | jq -r '.hcp.organization')
+          WS_NAME=$(echo "$CONFIG"       | jq -r '.hcp.workspace_name     // ""')
+          TF_VERSION=$(echo "$CONFIG"    | jq -r '.hcp.terraform_version  // "1.7.0"')
+          EXEC_MODE=$(echo "$CONFIG"     | jq -r '.hcp.execution_mode     // "remote"')
+          WORK_DIR=$(echo "$CONFIG"      | jq -r '.hcp.working_directory  // ""')
+          BRANCH=$(echo "$CONFIG"        | jq -r '.hcp.branch             // "main"')
+          AUTO_APPLY=$(echo "$CONFIG"    | jq -r '.hcp.auto_apply         // false')
+
+          # Validate required HCP fields
+          if [ -z "$TF_ORG" ] || [ "$TF_ORG" = "null" ]; then
+            echo "ERROR: config.hcp.organization is required"
+            exit 1
+          fi
+
+          # Default workspace name to repository name if not specified
+          [ -z "$WS_NAME" ] || [ "$WS_NAME" = "null" ] && WS_NAME="${GITHUB_REPOSITORY##*/}"
+
+          # ── GitHub Environments ──
+          PROD_ENV=$(echo "$CONFIG"      | jq -r '.github.production_environment // "production"')
+          WAIT_TIMER=$(echo "$CONFIG"    | jq -r '.github.wait_timer             // 0')
+          REVIEWER_TEAMS=$(echo "$CONFIG"| jq -r '.github.reviewer_teams         // [] | join(",")')
+
+          # ── Ruleset ──
+          CREATE_RULESET=$(echo "$CONFIG"     | jq -r '.ruleset.enabled                 // true')
+          RULESET_BRANCH=$(echo "$CONFIG"     | jq -r '.ruleset.target_branch           // "~DEFAULT_BRANCH"')
+          REQUIRE_PR=$(echo "$CONFIG"         | jq -r '.ruleset.require_pr              // true')
+          REQ_APPROVALS=$(echo "$CONFIG"      | jq -r '.ruleset.required_approvals      // 1')
+          DISMISS_STALE=$(echo "$CONFIG"      | jq -r '.ruleset.dismiss_stale_reviews   // true')
+          STATUS_CHECKS=$(echo "$CONFIG"      | jq -c '.ruleset.required_status_checks  // []')
+          BLOCK_FORCE=$(echo "$CONFIG"        | jq -r '.ruleset.block_force_pushes      // true')
+          PREVENT_DEL=$(echo "$CONFIG"        | jq -r '.ruleset.prevent_deletion        // true')
+          BRANCH_PATTERN=$(echo "$CONFIG"     | jq -r '.ruleset.branch_name_pattern     // ""')
+
+          # Export everything as step outputs
+          {
+            echo "tfe_address=$TFE_ADDRESS"
+            echo "tf_org=$TF_ORG"
+            echo "ws_name=$WS_NAME"
+            echo "tf_version=$TF_VERSION"
+            echo "exec_mode=$EXEC_MODE"
+            echo "work_dir=$WORK_DIR"
+            echo "branch=$BRANCH"
+            echo "auto_apply=$AUTO_APPLY"
+            echo "prod_env=$PROD_ENV"
+            echo "wait_timer=$WAIT_TIMER"
+            echo "reviewer_teams=$REVIEWER_TEAMS"
+            echo "create_ruleset=$CREATE_RULESET"
+            echo "ruleset_branch=$RULESET_BRANCH"
+            echo "require_pr=$REQUIRE_PR"
+            echo "req_approvals=$REQ_APPROVALS"
+            echo "dismiss_stale=$DISMISS_STALE"
+            echo "status_checks=$STATUS_CHECKS"
+            echo "block_force=$BLOCK_FORCE"
+            echo "prevent_del=$PREVENT_DEL"
+            echo "branch_pattern=$BRANCH_PATTERN"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Config parsed successfully"
+          echo "  HCP org      : $TF_ORG"
+          echo "  Workspace    : $WS_NAME"
+          echo "  TF version   : $TF_VERSION"
+          echo "  Environments : $(echo "$CONFIG" | jq -r '[.environments[].name] | join(",")')"
+
+      # ── Step 1: Check whether the HCP Terraform workspace already exists ──
+      - name: Check workspace exists
+        id: check
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+          TFE_ADDRESS: ${{ steps.parse.outputs.tfe_address }}
+          TF_ORG: ${{ steps.parse.outputs.tf_org }}
+          WS_NAME: ${{ steps.parse.outputs.ws_name }}
+        run: |
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            --header "Authorization: Bearer $TFE_TOKEN" \
+            --header "Content-Type: application/vnd.api+json" \
+            "$TFE_ADDRESS/api/v2/organizations/$TF_ORG/workspaces/$WS_NAME")
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            WS_ID=$(curl -s \
+              --header "Authorization: Bearer $TFE_TOKEN" \
+              --header "Content-Type: application/vnd.api+json" \
+              "$TFE_ADDRESS/api/v2/organizations/$TF_ORG/workspaces/$WS_NAME" \
+              | jq -r '.data.id')
+            echo "exists=true"        >> "$GITHUB_OUTPUT"
+            echo "workspace_id=$WS_ID" >> "$GITHUB_OUTPUT"
+            echo "Workspace '$WS_NAME' already exists: $WS_ID"
+          else
+            echo "exists=false"  >> "$GITHUB_OUTPUT"
+            echo "workspace_id=" >> "$GITHUB_OUTPUT"
+            echo "Workspace '$WS_NAME' does not exist — will create"
+          fi
+
+      # ── Step 2: Create the workspace (skipped if it already exists) ──
+      - name: Create HCP Terraform workspace
+        id: create
+        if: steps.check.outputs.exists == 'false'
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+          TFE_ADDRESS: ${{ steps.parse.outputs.tfe_address }}
+          TF_ORG: ${{ steps.parse.outputs.tf_org }}
+          WS_NAME: ${{ steps.parse.outputs.ws_name }}
+          TF_VERSION: ${{ steps.parse.outputs.tf_version }}
+          EXEC_MODE: ${{ steps.parse.outputs.exec_mode }}
+          WORK_DIR: ${{ steps.parse.outputs.work_dir }}
+          AUTO_APPLY: ${{ steps.parse.outputs.auto_apply }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg name       "$WS_NAME" \
+            --arg tf_ver     "$TF_VERSION" \
+            --arg exec_mode  "$EXEC_MODE" \
+            --arg work_dir   "$WORK_DIR" \
+            --arg repo       "$GITHUB_REPOSITORY" \
+            --argjson auto   "$AUTO_APPLY" \
+            '{
+              data: {
+                type: "workspaces",
+                attributes: {
+                  name:                $name,
+                  "terraform-version": $tf_ver,
+                  "auto-apply":        $auto,
+                  "execution-mode":    $exec_mode,
+                  "working-directory": $work_dir,
+                  description: ("Managed by GCP Project Onboarding — repo: " + $repo)
+                }
+              }
+            }')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --request POST \
+            --header "Authorization: Bearer $TFE_TOKEN" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data "$PAYLOAD" \
+            "$TFE_ADDRESS/api/v2/organizations/$TF_ORG/workspaces")
+
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_STATUS" != "201" ]; then
+            echo "ERROR: Failed to create workspace (HTTP $HTTP_STATUS)"
+            echo "$BODY" | jq .
+            exit 1
+          fi
+
+          WS_ID=$(echo "$BODY" | jq -r '.data.id')
+          echo "workspace_id=$WS_ID" >> "$GITHUB_OUTPUT"
+          echo "Workspace '$WS_NAME' created: $WS_ID"
+
+      # ── Step 3: Resolve workspace ID from either create or check step ──
+      - name: Resolve workspace ID
+        id: resolve
+        run: |
+          WS_ID="${{ steps.create.outputs.workspace_id || steps.check.outputs.workspace_id }}"
+          if [ -z "$WS_ID" ]; then
+            echo "ERROR: Could not resolve workspace ID"
+            exit 1
+          fi
+          echo "workspace_id=$WS_ID" >> "$GITHUB_OUTPUT"
+          echo "Using workspace ID: $WS_ID"
+
+      # ── Step 4: Link VCS repository to the workspace ──
+      - name: Link VCS repository
+        id: link-vcs
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+          OAUTH_TOKEN_ID: ${{ secrets.TF_VCS_OAUTH_TOKEN_ID }}
+          TFE_ADDRESS: ${{ steps.parse.outputs.tfe_address }}
+          BRANCH: ${{ steps.parse.outputs.branch }}
+          WORK_DIR: ${{ steps.parse.outputs.work_dir }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg repo      "$GITHUB_REPOSITORY" \
+            --arg oauth_id  "$OAUTH_TOKEN_ID" \
+            --arg branch    "$BRANCH" \
+            --arg work_dir  "$WORK_DIR" \
+            '{
+              data: {
+                type: "workspaces",
+                attributes: {
+                  "vcs-repo": {
+                    identifier:      $repo,
+                    "oauth-token-id": $oauth_id,
+                    branch:          $branch,
+                    "default-branch": true
+                  },
+                  "working-directory": $work_dir,
+                  "trigger-prefixes":  []
+                }
+              }
+            }')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --request PATCH \
+            --header "Authorization: Bearer $TFE_TOKEN" \
+            --header "Content-Type: application/vnd.api+json" \
+            --data "$PAYLOAD" \
+            "$TFE_ADDRESS/api/v2/workspaces/${{ steps.resolve.outputs.workspace_id }}")
+
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "ERROR: Failed to link VCS repository (HTTP $HTTP_STATUS)"
+            echo "$RESPONSE" | head -n -1 | jq .
+            exit 1
+          fi
+          echo "VCS repository '$GITHUB_REPOSITORY' linked to workspace"
+
+      # ── Step 5: Set HCP Terraform workspace variables ──
+      - name: Set workspace variables
+        id: set-vars
+        env:
+          TFE_TOKEN: ${{ secrets.TFE_TOKEN }}
+          TFE_ADDRESS: ${{ steps.parse.outputs.tfe_address }}
+        run: |
+          CONFIG=$(jq -c 'del(.. | ._comment?)' env.json)
+          WS_ID="${{ steps.resolve.outputs.workspace_id }}"
+
+          set_var() {
+            local KEY="$1" VALUE="$2" SENSITIVE="$3" CATEGORY="$4"
+
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              --request POST \
+              --header "Authorization: Bearer $TFE_TOKEN" \
+              --header "Content-Type: application/vnd.api+json" \
+              --data "$(jq -n \
+                --arg key  "$KEY" --arg val "$VALUE" \
+                --arg cat  "$CATEGORY" --argjson sens "$SENSITIVE" \
+                --arg wsid "$WS_ID" \
+                '{data:{type:"vars",attributes:{key:$key,value:$val,sensitive:$sens,category:$cat,hcl:false},relationships:{workspace:{data:{type:"workspaces",id:$wsid}}}}}')" \
+              "$TFE_ADDRESS/api/v2/vars")
+
+            HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+
+            if [ "$HTTP_STATUS" = "422" ]; then
+              # Variable already exists — find its ID and update
+              VAR_ID=$(curl -s \
+                --header "Authorization: Bearer $TFE_TOKEN" \
+                --header "Content-Type: application/vnd.api+json" \
+                "$TFE_ADDRESS/api/v2/workspaces/$WS_ID/vars" \
+                | jq -r --arg k "$KEY" '.data[] | select(.attributes.key == $k) | .id')
+              curl -s -o /dev/null \
+                --request PATCH \
+                --header "Authorization: Bearer $TFE_TOKEN" \
+                --header "Content-Type: application/vnd.api+json" \
+                --data "$(jq -n --arg id "$VAR_ID" --arg val "$VALUE" --argjson sens "$SENSITIVE" \
+                  '{data:{type:"vars",id:$id,attributes:{value:$val,sensitive:$sens}}}')" \
+                "$TFE_ADDRESS/api/v2/vars/$VAR_ID"
+              echo "  Updated variable: $KEY"
+            elif [ "$HTTP_STATUS" = "201" ]; then
+              echo "  Created variable: $KEY"
+            else
+              echo "ERROR: Failed to set variable '$KEY' (HTTP $HTTP_STATUS)"
+              exit 1
+            fi
+          }
+
+          # Read workspace_variables array from config and iterate
+          VAR_COUNT=$(echo "$CONFIG" | jq '.hcp.workspace_variables | length // 0')
+          if [ "$VAR_COUNT" = "0" ]; then
+            echo "No workspace variables defined in config — skipping"
+          else
+            echo "$CONFIG" | jq -c '.hcp.workspace_variables[]' | while read -r VAR; do
+              KEY=$(echo "$VAR"       | jq -r '.key')
+              VALUE=$(echo "$VAR"     | jq -r '.value')
+              SENSITIVE=$(echo "$VAR" | jq -r '.sensitive // false')
+              CATEGORY=$(echo "$VAR"  | jq -r '.category // "terraform"')
+              set_var "$KEY" "$VALUE" "$SENSITIVE" "$CATEGORY"
+            done
+          fi
+
+      # ── Step 6: Create / update GitHub Environments ──
+      - name: Setup GitHub environments
+        id: setup-environments
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+          PROD_ENV: ${{ steps.parse.outputs.prod_env }}
+          WAIT_TIMER: ${{ steps.parse.outputs.wait_timer }}
+          REVIEWER_TEAMS: ${{ steps.parse.outputs.reviewer_teams }}
+        run: |
+          CONFIG=$(jq -c 'del(.. | ._comment?)' env.json)
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          REPO="$GITHUB_REPOSITORY"
+
+          # Resolve reviewer team slugs → integer IDs (done once before the env loop)
+          REVIEWER_IDS="[]"
+          if [ -n "$REVIEWER_TEAMS" ]; then
+            REVIEWER_IDS="["
+            FIRST=true
+            IFS=',' read -ra TEAMS <<< "$REVIEWER_TEAMS"
+            for SLUG in "${TEAMS[@]}"; do
+              SLUG=$(echo "$SLUG" | tr -d ' ')
+              TEAM_RESP=$(curl -s -w "\n%{http_code}" \
+                --header "Authorization: Bearer $GITHUB_PAT" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/orgs/$OWNER/teams/$SLUG")
+              HTTP_STATUS=$(echo "$TEAM_RESP" | tail -1)
+              BODY=$(echo "$TEAM_RESP" | head -n -1)
+              if [ "$HTTP_STATUS" != "200" ]; then
+                echo "ERROR: Could not resolve team '$SLUG' (HTTP $HTTP_STATUS)"
+                echo "$BODY" | jq .
+                exit 1
+              fi
+              TEAM_ID=$(echo "$BODY" | jq -r '.id')
+              [ "$FIRST" = "true" ] && FIRST=false || REVIEWER_IDS="$REVIEWER_IDS,"
+              REVIEWER_IDS="${REVIEWER_IDS}{\"type\":\"Team\",\"id\":$TEAM_ID}"
+            done
+            REVIEWER_IDS="$REVIEWER_IDS]"
+          fi
+
+          # Iterate over environments defined in config
+          echo "$CONFIG" | jq -c '.environments[]' | while read -r ENV_OBJ; do
+            ENV_NAME=$(echo "$ENV_OBJ"   | jq -r '.name')
+            GCP_ID=$(echo "$ENV_OBJ"     | jq -r '.gcp_project_id // empty')
+
+            echo "--- Configuring environment: $ENV_NAME"
+
+            # Approval gate: exact match against production_environment
+            if [ "$ENV_NAME" = "$PROD_ENV" ]; then
+              PAYLOAD=$(jq -n \
+                --argjson wait      "$WAIT_TIMER" \
+                --argjson reviewers "$REVIEWER_IDS" \
+                '{wait_timer:$wait,prevent_self_review:false,reviewers:$reviewers,deployment_branch_policy:null}')
+              echo "  Tier: production — approval gate enabled (wait=${WAIT_TIMER}m)"
+            else
+              PAYLOAD='{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}'
+              echo "  Tier: non-production — no approval gate"
+            fi
+
+            # PUT is always an upsert — safe to re-run
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              --request PUT \
+              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data "$PAYLOAD" \
+              "https://api.github.com/repos/$REPO/environments/$ENV_NAME")
+
+            HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+            if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
+              echo "ERROR: Failed to configure environment '$ENV_NAME' (HTTP $HTTP_STATUS)"
+              echo "$RESPONSE" | head -n -1 | jq .
+              exit 1
+            fi
+            echo "  Environment '$ENV_NAME' configured (HTTP $HTTP_STATUS)"
+
+            # Set GCP_PROJECT_ID environment variable
+            if [ -n "$GCP_ID" ]; then
+              VAR_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                --request POST \
+                --header "Authorization: Bearer $GITHUB_PAT" \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/json" \
+                --data "{\"name\":\"GCP_PROJECT_ID\",\"value\":\"$GCP_ID\"}" \
+                "https://api.github.com/repos/$REPO/environments/$ENV_NAME/variables")
+
+              VAR_STATUS=$(echo "$VAR_RESPONSE" | tail -1)
+              if [ "$VAR_STATUS" = "409" ]; then
+                # Variable exists — update it
+                curl -s -o /dev/null \
+                  --request PATCH \
+                  --header "Authorization: Bearer $GITHUB_PAT" \
+                  --header "Accept: application/vnd.github+json" \
+                  --header "X-GitHub-Api-Version: 2022-11-28" \
+                  --header "Content-Type: application/json" \
+                  --data "{\"value\":\"$GCP_ID\"}" \
+                  "https://api.github.com/repos/$REPO/environments/$ENV_NAME/variables/GCP_PROJECT_ID"
+                echo "  GCP_PROJECT_ID updated: $GCP_ID"
+              elif [ "$VAR_STATUS" = "201" ]; then
+                echo "  GCP_PROJECT_ID created: $GCP_ID"
+              else
+                echo "ERROR: Failed to set GCP_PROJECT_ID for '$ENV_NAME' (HTTP $VAR_STATUS)"
+                echo "$VAR_RESPONSE" | head -n -1 | jq .
+                exit 1
+              fi
+            else
+              echo "  GCP_PROJECT_ID not provided for '$ENV_NAME' — skipping"
+            fi
+          done
+
+      # ── Step 7: Create / update repository ruleset ──
+      - name: Setup repository ruleset
+        id: setup-ruleset
+        if: steps.parse.outputs.create_ruleset == 'true'
+        env:
+          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}
+        run: |
+          RULESET_NAME="standard-branch-protection"
+
+          EXISTING_ID=$(curl -s \
+            --header "Authorization: Bearer $GITHUB_PAT" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets" \
+            | jq -r --arg name "$RULESET_NAME" '.[] | select(.name == $name) | .id // empty')
+
+          # Build rules array from parsed config outputs
+          RULES="["
+          FIRST_RULE=true
+          add_rule() {
+            [ "$FIRST_RULE" = "true" ] && FIRST_RULE=false || RULES="$RULES,"
+            RULES="$RULES$1"
+          }
+
+          [ "${{ steps.parse.outputs.prevent_del }}"  = "true" ] && add_rule '{"type":"deletion"}'
+          [ "${{ steps.parse.outputs.block_force }}"  = "true" ] && add_rule '{"type":"non_fast_forward"}'
+
+          if [ "${{ steps.parse.outputs.require_pr }}" = "true" ]; then
+            add_rule "{\"type\":\"pull_request\",\"parameters\":{
+              \"required_approving_review_count\":${{ steps.parse.outputs.req_approvals }},
+              \"dismiss_stale_reviews_on_push\":${{ steps.parse.outputs.dismiss_stale }},
+              \"require_code_owner_review\":false,
+              \"require_last_push_approval\":false,
+              \"required_review_thread_resolution\":false}}"
+          fi
+
+          STATUS_CHECKS='${{ steps.parse.outputs.status_checks }}'
+          CHECKS_COUNT=$(echo "$STATUS_CHECKS" | jq 'length')
+          if [ "$CHECKS_COUNT" -gt "0" ]; then
+            CHECKS_PAYLOAD=$(echo "$STATUS_CHECKS" | jq '[.[] | {"context":., "integration_id":null}]')
+            add_rule "{\"type\":\"required_status_checks\",\"parameters\":{
+              \"required_status_checks\":$CHECKS_PAYLOAD,
+              \"strict_required_status_checks_policy\":false}}"
+          fi
+
+          BRANCH_PATTERN='${{ steps.parse.outputs.branch_pattern }}'
+          if [ -n "$BRANCH_PATTERN" ]; then
+            add_rule "{\"type\":\"branch_name_pattern\",\"parameters\":{
+              \"name\":\"Branch naming convention\",
+              \"negate\":false,
+              \"operator\":\"regex\",
+              \"pattern\":\"$BRANCH_PATTERN\"}}"
+          fi
+
+          RULES="$RULES]"
+
+          PAYLOAD=$(jq -n \
+            --arg  name   "$RULESET_NAME" \
+            --arg  branch "${{ steps.parse.outputs.ruleset_branch }}" \
+            --argjson rules "$RULES" \
+            '{name:$name,target:"branch",enforcement:"active",
+              conditions:{ref_name:{include:[$branch],exclude:[]}},
+              rules:$rules}')
+
+          if [ -n "$EXISTING_ID" ]; then
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              --request PUT \
+              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data "$PAYLOAD" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets/$EXISTING_ID")
+            ACTION="updated"
+          else
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              --request POST \
+              --header "Authorization: Bearer $GITHUB_PAT" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --header "Content-Type: application/json" \
+              --data "$PAYLOAD" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/rulesets")
+            ACTION="created"
+          fi
+
+          HTTP_STATUS=$(echo "$RESPONSE" | tail -1)
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ]; then
+            echo "ERROR: Failed to $ACTION ruleset (HTTP $HTTP_STATUS)"
+            echo "$RESPONSE" | head -n -1 | jq .
+            exit 1
+          fi
+          echo "Ruleset '$RULESET_NAME' $ACTION (HTTP $HTTP_STATUS)"
+
+      # ── Step 8: Write job summary ──
+      - name: Write job summary
+        if: always()
+        run: |
+          CONFIG=$(jq -c 'del(.. | ._comment?)' env.json)
+          WS_STATUS="updated (already existed)"
+          [ "${{ steps.check.outputs.exists }}" = "false" ] && WS_STATUS="created"
+
+          ENVS=$(echo "$CONFIG" | jq -r '[.environments[].name] | join(", ")')
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ### GCP Project Onboarding Summary
+
+          | Resource | Value | Status |
+          |---|---|---|
+          | HCP organisation | ${{ steps.parse.outputs.tf_org }} | — |
+          | HCP workspace | ${{ steps.parse.outputs.ws_name }} | $WS_STATUS |
+          | Workspace ID | ${{ steps.resolve.outputs.workspace_id }} | — |
+          | Repository | $GITHUB_REPOSITORY | linked |
+          | Environments | $ENVS | configured |
+          | Production approval gate | ${{ steps.parse.outputs.prod_env }} | enabled |
+          | Repository ruleset | standard-branch-protection | ${{ steps.parse.outputs.create_ruleset == 'true' && 'configured' || 'skipped' }} |
+          EOF

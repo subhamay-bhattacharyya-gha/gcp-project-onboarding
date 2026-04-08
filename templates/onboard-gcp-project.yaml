@@ -1,0 +1,28 @@
+# ============================================================
+# GCP Project Onboarding — Caller Workflow
+# Repository : <ORG>/<YOUR-APP-REPO>
+#
+# The reusable workflow reads env.json directly from the caller
+# repository root — no config input is needed.
+#
+# Prerequisites:
+#   1. Copy env.json from the platform repo to the root of this
+#      repository and fill in your values.
+#   2. Org-level secrets configured in GitHub:
+#        TFE_TOKEN, TF_VCS_OAUTH_TOKEN_ID, GITHUB_PAT
+# ============================================================
+
+name: Onboard GCP Project
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'env.json'
+      - '.github/workflows/onboard-gcp-project.yaml'
+  workflow_dispatch:
+
+jobs:
+  onboard:
+    uses: <ORG>/gcp-project-onboarding/.github/workflows/gcp-project-onboarding.yaml@v1
+    secrets: inherit
