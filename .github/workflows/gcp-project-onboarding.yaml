@@ -390,14 +390,16 @@ jobs:
 
             # Approval gate: exact match against production_environment
             if [ "$ENV_NAME" = "$PROD_ENV" ]; then
+              HAS_REVIEWERS=$(echo "$REVIEWER_IDS" | jq 'length > 0')
               PAYLOAD=$(jq -n \
                 --argjson wait      "$WAIT_TIMER" \
                 --argjson reviewers "$REVIEWER_IDS" \
-                '{wait_timer:$wait,prevent_self_review:true,reviewers:$reviewers,deployment_branch_policy:null}')
-              echo "  Tier: production — approval gate enabled (wait=${WAIT_TIMER}m, self-review blocked)"
+                --argjson psr       "$HAS_REVIEWERS" \
+                '{wait_timer:$wait,prevent_self_review:$psr,reviewers:$reviewers,deployment_branch_policy:null}')
+              echo "  Tier: production — approval gate enabled (wait=${WAIT_TIMER}m, self-review blocked=$HAS_REVIEWERS)"
             else
-              PAYLOAD='{"wait_timer":0,"prevent_self_review":true,"reviewers":[],"deployment_branch_policy":null}'
-              echo "  Tier: non-production — self-review blocked"
+              PAYLOAD='{"wait_timer":0,"prevent_self_review":false,"reviewers":[],"deployment_branch_policy":null}'
+              echo "  Tier: non-production — no approval gate"
             fi
 
             # PUT is always an upsert — safe to re-run
